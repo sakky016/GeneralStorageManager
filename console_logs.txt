@@ -5267,6 +5267,3 @@ Custom dealloc for 0x13021472
 +-------------------------------------------------------+
 
 ** Time required (using storage manager) : 1451 ms
-
-
-*** Time comparison of Storage manager: -inf %
