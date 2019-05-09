@@ -7,9 +7,23 @@
 //----------------------------------------------------------------------------------------------
 // Configurations
 //----------------------------------------------------------------------------------------------
-const unsigned int REPEATS = 210000;   // Number of rounds of simulation
-const int MAX_LEN = 100;              // Max length of allocation (bytes)
-const bool DO_DEALLOCS = true;
+#ifdef TEST
+// Number of rounds of simulation
+const unsigned int REPEATS = 100;
+#else
+const unsigned int REPEATS = 250000;
+#endif
+
+// Max length of allocated string (bytes)
+const int MAX_LEN = 100;
+
+// Enter a value between (0 - 100). 0 - means no deallocations will be done. 100 means 
+// 1 deallocation will be attempted in every cycle. Higher the number of deallocations
+// per cycle, greater is the performance of our custom Storage manager. This is 
+// because cache memory will be available more often.
+const int DO_DEALLOCS_PERCENT = 95;
+
+// Enable both to simulate comparatively
 const bool USE_STORAGE_MANAGER = true;
 const bool USE_NATIVE_MALLOC = true;
 
@@ -23,7 +37,11 @@ unsigned long long g_countAllocsFailed = 0;
 unsigned long long g_countFrees = 0;
 
 //----------------------------------------------------------------------------------------------
-// DisplayStats of allocation/deallocation
+// @name                    : DisplayStats
+//
+// @description             : DisplayStats of allocation/deallocation
+//
+// @returns                 : Nothing
 //----------------------------------------------------------------------------------------------
 void DisplayStats() 
 {
@@ -38,7 +56,12 @@ void DisplayStats()
 }
 
 //----------------------------------------------------------------------------------------------
-// Reset counts
+// @name                    : ResetCounts
+//
+// @description             : Reset global counters used for the simulation. This is called
+//                            at the start of each simulation.
+//
+// @returns                 : Nothing
 //----------------------------------------------------------------------------------------------
 void ResetCounts()
 {
@@ -48,7 +71,11 @@ void ResetCounts()
 }
 
 //----------------------------------------------------------------------------------------------
-// Get time stamp in milliseconds.
+// @name                    : getCurrentTimestampInMilliseconds
+//
+// @description             : Get time stamp in milliseconds.
+//
+// @returns                 : timestamp in milliseconds
 //----------------------------------------------------------------------------------------------
 long long getCurrentTimestampInMilliseconds()
 {
@@ -58,9 +85,41 @@ long long getCurrentTimestampInMilliseconds()
 }
 
 //----------------------------------------------------------------------------------------------
-// Simulation
+// @name                    : Cleanup
+//
+// @description             : Free the allocated memory. This is called at the end of simulation.
+//
+// @returns                 : Nothing
 //----------------------------------------------------------------------------------------------
-void DoSimulation(const vector<unsigned int> & rngList, bool useStorageManager)
+void Cleanup(vector<char *> & allocatedMemory, bool useStorageManager)
+{
+    for (size_t i = 0; i < allocatedMemory.size(); i++)
+    {
+        if (useStorageManager)
+        {
+            SM_DEALLOC(allocatedMemory[i]);
+        }
+        else
+        {
+            if (allocatedMemory[i])
+            {
+                free(allocatedMemory[i]);
+                allocatedMemory[i] = nullptr;
+            }
+        }
+    }
+
+    allocatedMemory.clear();
+}
+
+//----------------------------------------------------------------------------------------------
+// @name                    : DoSimulation
+//
+// @description             : Simulate the test. 
+//
+// @returns                 : Time taken for test to run (in milliseconds)
+//----------------------------------------------------------------------------------------------
+long long DoSimulation(const vector<unsigned int> & rngList, bool useStorageManager)
 {
     ResetCounts();
 
@@ -68,6 +127,11 @@ void DoSimulation(const vector<unsigned int> & rngList, bool useStorageManager)
 
     char *ptr = nullptr;
     unsigned int len = 0;
+    vector<char *> allocatedMemory;
+    long long timeStart = 0;
+    long long timeEnd = 0;
+
+    timeStart = getCurrentTimestampInMilliseconds();
 
     for (size_t i = 0; i < rngList.size(); i++)
     {
@@ -88,44 +152,61 @@ void DoSimulation(const vector<unsigned int> & rngList, bool useStorageManager)
 
             // Create a sample string of len
             string tmp_string;
-            for (int i = 0; i < len; i++)
+            for (size_t i = 0; i < len; i++)
             {
                 tmp_string.push_back('A');
             }
 
             strncpy(ptr, tmp_string.c_str(), len);
+            allocatedMemory.push_back(ptr);
 
-            if (DO_DEALLOCS)
+            if (DO_DEALLOCS_PERCENT)
             {
-                // Do deallocations randomly
-                if (rng.generateRandomNumber(10) < 5)
+                // Randomly delete an allocated memory
+                if (rng.generateRandomNumber(100) < DO_DEALLOCS_PERCENT)
                 {
-                    if (useStorageManager)
+                    int vectorIndex = rng.generateRandomNumber(allocatedMemory.size());
+                    char *ptrToDeallocate = allocatedMemory[vectorIndex];
+                    if (ptrToDeallocate)
                     {
-                        SM_DEALLOC(ptr);
+                        if (useStorageManager)
+                        {
+                            SM_DEALLOC(ptrToDeallocate);
+                        }
+                        else
+                        {
+                            free(ptrToDeallocate);
+                            ptrToDeallocate = nullptr;
+                        }
+
+                        allocatedMemory.erase(allocatedMemory.begin() + vectorIndex);
+                        g_countFrees++;
                     }
-                    else
-                    {
-                        free(ptr);
-                        ptr = nullptr;
-                    }
-                    g_countFrees++;
                 }
-            }
+            } // Dealloc
         }
         else
         {
-            cout << "*** Allocation failed!" << endl;
+            //cout << "*** Allocation failed!" << endl;
             g_countAllocsFailed++;
         }
-    }
+    }// Simulation ends here
 
+    timeEnd = getCurrentTimestampInMilliseconds();
+
+    // Cleanup the memory used by simulation
+    Cleanup(allocatedMemory, useStorageManager);
+
+    // Display statistics
     if (useStorageManager)
     {
+        //sm.DisplayMemoryMapDetails();
         sm.DisplayMemoryStats();
     }
 
     DisplayStats();
+
+    return (timeEnd - timeStart);
 }
 
 //----------------------------------------------------------------------------------------------
@@ -141,28 +222,28 @@ int main()
         rngList.push_back(1 + rng.generateRandomNumber(MAX_LEN));
     }
 
-    long long timeStart = 0;
-    long long timeEnd = 0;
+    long long timeRequired1 = 0;
+    long long timeRequired2 = 0;
     bool useStorageManager = false;
 
     // Simulate using native malloc and free
     if (USE_NATIVE_MALLOC)
     {
-        timeStart = getCurrentTimestampInMilliseconds();
-        DoSimulation(rngList, useStorageManager);
-        timeEnd = getCurrentTimestampInMilliseconds();
-        cout << endl << "** Time required (using native malloc)   : " << timeEnd - timeStart << " ms" << endl << endl;
+        
+        timeRequired1 = DoSimulation(rngList, useStorageManager);
+        cout << endl << "** Time required (using native malloc)   : " << timeRequired1 << " ms" << endl << endl;
     }
 
     // Simulate using StorageManager alloc/dealloc
     if (USE_STORAGE_MANAGER)
     {
         useStorageManager = true;
-        timeStart = getCurrentTimestampInMilliseconds();
-        DoSimulation(rngList, useStorageManager);
-        timeEnd = getCurrentTimestampInMilliseconds();
-        cout << endl << "** Time required (using storage manager) : " << timeEnd - timeStart << " ms" << endl << endl;
+        timeRequired2 = DoSimulation(rngList, useStorageManager);
+        cout << endl << "** Time required (using storage manager) : " << timeRequired2 << " ms" << endl << endl;
     }
+
+    float result = ((float)(timeRequired1 - timeRequired2) / timeRequired1) * 100;
+    printf("\n*** Time comparison of Storage manager: %f %%\n", result);
 
     getchar();
     return 0;

@@ -1,11 +1,19 @@
-﻿#include "sm.h"
+﻿#include<assert.h>
+#include "sm.h"
 #include<iostream> 
 #include<stdlib.h> 
 
+#ifdef TEST
 // Storage manager initial size
-const unsigned int SM_SIZE = 10 * 1024 * 1024;  // bytes
+const unsigned int SM_SIZE = 1000;  // bytes
+const bool DEBUG = true;
+#else
+const unsigned int SM_SIZE = 1024 * 1024 * 1024;  // bytes
 const bool DEBUG = false;
+#endif
+
 const bool DO_DEFRAGMENTATION = true;
+const bool USE_CACHE = true;
 
 //----------------------------------------------------------------------------------------------
 // Create global Storage Manager object which will be used by entire system
@@ -55,7 +63,10 @@ StorageManager::StorageManager(int size)
     m_chunkUsedSize = 0;
     m_countChunkAllocs = 0;
     m_countMemoryMapAllocs = 0;
+    m_countCacheAllocs = 0;
     m_countFrees = 0;
+    m_cacheBlockSize = 0;
+    m_cacheBlock = nullptr;
 }
 
 //----------------------------------------------------------------------------------------------
@@ -135,17 +146,7 @@ void * StorageManager::SM_alloc(size_t size)
     else
     {
         // Allocate from recycled memory
-        if (DEBUG)
-            cout << "  Allocating from recycled memory" << endl;
-
         ptr = GetMemoryFromMap(size);
-        if (ptr)
-        {
-            m_countMemoryMapAllocs++;
-        }
-
-        if (DEBUG)
-            DisplayMemoryMapDetails();
     }
 
     // Update metadata and memory map if a valid memory is allocated
@@ -157,7 +158,10 @@ void * StorageManager::SM_alloc(size_t size)
         m_memoryMap[ptr] = metaData;
 
         if (DEBUG)
+        {
             printf("  Allocated 0x%lu\n", ptr);
+            DisplayMemoryMapDetails();
+        }
     }
 
     return ptr;
@@ -178,7 +182,7 @@ void * StorageManager::SM_alloc(size_t size)
 void StorageManager::SM_dealloc(void *ptr)
 {
     if (DEBUG)
-        printf("Custom dealloc for %lu\n", (char*)ptr);
+        printf("\nCustom dealloc for 0x%lu\n", (char*)ptr);
 
     if (ptr == nullptr)
     {
@@ -188,90 +192,178 @@ void StorageManager::SM_dealloc(void *ptr)
     auto it = m_memoryMap.find((char*)ptr);
     if (it != m_memoryMap.end())
     {
+        sm_metaData_t & metaData = it->second;
+
         // Do not actually deallocate memory, Mark it as free
-        it->second.isFree = true;
+        metaData.isFree = true;
+
+        int defragCount = 0;
+        if (DO_DEFRAGMENTATION)
+        {
+            defragCount = HandleFragmentedMemory((char*)ptr, metaData, nullptr);
+        }
+
+        // Update the cache block if the size of this freed block 
+        // is larger than the current cache block
+        if (it->second.size > m_cacheBlockSize)
+        {
+            m_cacheBlockSize = metaData.size;
+            m_cacheBlock = it->first;
+        }
+
+        if (DEBUG)
+        {
+            if (defragCount)
+            {
+                printf ("  Memory map Defragmentation done %d times\n", defragCount);
+            }
+            
+            DisplayCacheMemoryDetails();
+            DisplayMemoryMapDetails();
+        }
+
         m_countFrees++;
     }
     else
     {
-        cout << "Invalid memory address provided!" << endl;
-    }
-
-    sm_metaData_t & metaData = it->second;
-    if (DO_DEFRAGMENTATION)
-    {
-        HandleFragmentedMemory((char*)ptr, metaData);
-
-        if (DEBUG)
-        {
-            DisplayMemoryMapDetails();
-        }
+        cout << "*** DEALLOC ERROR: Invalid memory address provided!" << endl;
     }
 }
 
 //----------------------------------------------------------------------------------------------
-// @name                    : DisplayMemoryStats
+// @name                    : FindNextFreeSpaceInMemoryMap
 //
-// @description             : Memory usage statistics
+// @description             : Finds out the free block in Memory map next to the given block.
 //
-// @returns                 : Nothing
+// @returns                 : If a free block is found, then pointer to free block, 
+//                            nullptr otherwise.
 //----------------------------------------------------------------------------------------------
-void StorageManager::DisplayMemoryStats()
+char* StorageManager::FindNextFreeSpaceInMemoryMap(char *ptr)
 {
-    size_t freeSpaceInMemoryMap = FindFreeSpaceInMemoryMap();
-    printf("+-------------------------------------------------------+\n");
-    printf("|              Storage Manager Statistics               |\n");
-    printf("+-------------------------------------------------------+\n");
-    printf("| Total chunk size                 : %-12ld bytes |\n", m_chunkTotalSize);
-    printf("| Used chunk size                  : %-12ld bytes |\n", m_chunkUsedSize);
-    printf("| Available chunk size             : %-12ld bytes |\n", m_chunkTotalSize - m_chunkUsedSize);
-    printf("| Reusable recycled memory size    : %-12ld bytes |\n", freeSpaceInMemoryMap);
-    printf("| Total Allocs                     : %-12llu       |\n", m_countChunkAllocs + m_countMemoryMapAllocs);
-    printf("|  a) From memory chunk            : %-12llu       |\n", m_countChunkAllocs);
-    printf("|  b) From recycled memory         : %-12llu       |\n", m_countMemoryMapAllocs);
-    printf("| Total Frees                      : %-12llu       |\n", m_countFrees);
-    printf("+-------------------------------------------------------+\n");
+    auto it = m_memoryMap.find(ptr);
+    if (it != m_memoryMap.end())
+    {
+        while (it != m_memoryMap.end())
+        {
+            sm_metaData_t metaData = it->second;
+            if (metaData.isFree && it->first != ptr)
+            {
+                return it->first;
+            }
+
+            it++;
+        }
+    }
+
+    return nullptr;
 }
 
 //----------------------------------------------------------------------------------------------
 // @name                    : FindFreeSpaceInMemoryMap
 //
-// @description             : Finds out the total size of free memory available in the 
-//                            memory map.
+// @description             : Finds out the first free block in Memory map.
 //
-// @returns                 : Total Size of free memory in Memory map
+// @returns                 : If a free block is found, then pointer to free block, 
+//                            nullptr otherwise.
 //----------------------------------------------------------------------------------------------
-size_t StorageManager::FindFreeSpaceInMemoryMap()
+char* StorageManager::FindFreeSpaceInMemoryMap()
 {
-    size_t freeSpaceInMemoryMap = 0;
     for (auto it = m_memoryMap.begin(); it != m_memoryMap.end(); it++)
     {
         sm_metaData_t metaData = it->second;
         if (metaData.isFree)
         {
-            freeSpaceInMemoryMap += metaData.size;
+            return it->first;
         }
     }
 
-    return freeSpaceInMemoryMap;
+    return nullptr;
 }
 
 //----------------------------------------------------------------------------------------------
-// @name                    : DisplayMemoryMapDetails
+// @name                    : FindFreeSpaceSizeInMemoryMap
 //
-// @description             : Displays the address, size and free/occupied status of memory map
+// @description             : Finds out the first free block in Memory map.
 //
-// @returns                 : Nothing
+// @returns                 : If a free block is found, then pointer to free block, 
+//                            nullptr otherwise.
 //----------------------------------------------------------------------------------------------
-void StorageManager::DisplayMemoryMapDetails()
+size_t StorageManager::FindFreeSpaceSizeInMemoryMap()
 {
-    printf("\nFree space in memory map:\n");
-    size_t freeSpaceInMemoryMap = 0;
+    size_t totalFreeSize = 0;
+
     for (auto it = m_memoryMap.begin(); it != m_memoryMap.end(); it++)
     {
         sm_metaData_t metaData = it->second;
-        printf("0x%lu : %lu bytes  <%s>\n", it->first, metaData.size, metaData.isFree ? "Free" : "Occupied");
+        if (metaData.isFree)
+        {
+            totalFreeSize += metaData.size;
+        }
     }
+
+    return totalFreeSize;
+}
+
+//----------------------------------------------------------------------------------------------
+// @name                    : FetchMemoryIfAvailable
+//
+// @description             : Given the memory address, this function checks if it is marked 
+//                            as free in the memory map and has adequate size to cater to
+//                            the requested alloc size. It also merges the leftover space
+//                            with the subsequent free blocks (if available). In this process
+//                            it also tries to check additional free blocks and merges (defragments) 
+//                            them to form a single large block.
+//
+// @returns                 : pointer to memory in memory map
+//----------------------------------------------------------------------------------------------
+inline char *StorageManager::FetchMemoryIfAvailable(const size_t size, char *ptrToCheck, sm_metaData_t & metaData)
+{
+    char *ptr = nullptr; 
+
+    if (DEBUG && metaData.isFree)
+    {
+        printf("  Required: %u, inMap: %u\n", size, metaData.size);
+    }
+
+    if (metaData.isFree == true && metaData.size >= size)
+    {
+        ptr = ptrToCheck;
+        size_t originalBlockSize = metaData.size;
+        metaData.size = size;
+        metaData.isFree = false;
+
+        // What to do if there is some memory left after this allocation?
+        if (originalBlockSize > size)
+        {
+            sm_metaData_t fragmentedMetaData;
+            fragmentedMetaData.isFree = true;
+            fragmentedMetaData.size = originalBlockSize - size;
+            char *fragmentedPtr = ptr + size;
+
+            int defragCount = 0;
+            if (DO_DEFRAGMENTATION)
+            {
+                defragCount = HandleFragmentedMemory(fragmentedPtr, fragmentedMetaData, nullptr);
+            }
+
+            // Add the defragmented memory to the map
+            m_memoryMap[fragmentedPtr] = fragmentedMetaData;
+            
+            if (DEBUG)
+            {
+                printf("Adding fragmented block 0x%lu to memory map\n", fragmentedPtr);
+
+                if (defragCount)
+                {
+                    printf("  Defragmentation done %d times\n", defragCount);
+                }
+
+                DisplayMemoryMapDetails();
+            }
+        }
+    }
+
+    return ptr;
 }
 
 //----------------------------------------------------------------------------------------------
@@ -286,42 +378,73 @@ void StorageManager::DisplayMemoryMapDetails()
 char* StorageManager::GetMemoryFromMap(size_t size)
 {
     char *ptr = nullptr;
+
+    if (USE_CACHE)
+    {
+        if (DEBUG)
+        {
+            DisplayCacheMemoryDetails();
+        }
+
+        // Check if memory can be allocated from the cached block
+        if (m_cacheBlockSize >= size)
+        {
+            sm_metaData_t & metaData = m_memoryMap[m_cacheBlock];
+            ptr = FetchMemoryIfAvailable(size, m_cacheBlock, metaData);
+
+            if (ptr)
+            {
+                if (DEBUG)
+                {
+                    printf("  Adding block 0x%lu from cache\n", ptr);
+                }
+
+                m_countCacheAllocs++;
+
+                // Update the cache with the 1st available free block
+                // in memory map. This is sort of a compromise as we
+                // could have obtained the largest free block, but that 
+                // would involve traversing the memory map, which we are
+                // avoiding. This is the reason cache was brough in the first
+                // place - to avoid memory map traversal on every 
+                // allocation request.
+                m_cacheBlock = FindFreeSpaceInMemoryMap();
+                if (m_cacheBlock)
+                {
+                    m_cacheBlockSize = m_memoryMap[m_cacheBlock].size;
+                }
+                else
+                {
+                    // No free space avaiable in Memory map. Set the 
+                    // cache to NULL
+                    m_cacheBlock = nullptr;
+                    m_cacheBlockSize = 0;
+                }
+
+                return ptr;
+            }
+            else
+            {
+                if (DEBUG)
+                    printf("  Not found in cache\n");
+            }
+        }
+    } // Use of cache
+
+    // Required M/m not found in cache, look in the entire Memory Map
     for (auto it = m_memoryMap.begin(); it != m_memoryMap.end(); it++)
     {
         sm_metaData_t & metaData = it->second;
-
-        if (DEBUG && metaData.isFree)
+        char *ptrToCheck = it->first;
+        ptr = FetchMemoryIfAvailable(size, ptrToCheck, metaData);
+        if (ptr)
         {
-            printf("Required: %u, inMap: %u\n", size, metaData.size);
-        }
-
-        if (metaData.isFree == true && metaData.size >= size)
-        {
-            ptr = it->first;
-            size_t originalBlockSize = metaData.size;
-            metaData.size = size;
-
-            // What to do if there is some memory left after this allocation?
-            if (originalBlockSize > size)
+            if (DEBUG)
             {
-                sm_metaData_t fragmentedMetaData;
-                fragmentedMetaData.isFree = true;
-                fragmentedMetaData.size = originalBlockSize - size;
-                char *fragmentedPtr = ptr + size;
-
-                if (DEBUG)
-                    printf("Adding fragmented block 0x%lu to memory map\n", fragmentedPtr);
-
-                if (DO_DEFRAGMENTATION)
-                {
-                    HandleFragmentedMemory(fragmentedPtr, fragmentedMetaData);
-                }
-
-                // Add the defragmented memory to the map
-                m_memoryMap[fragmentedPtr] = fragmentedMetaData;
+                printf("  Adding block 0x%lu from Memory map\n", ptr);
             }
 
-            // Found space from recycled memory
+            m_countMemoryMapAllocs++;
             break;
         }
     }
@@ -330,27 +453,85 @@ char* StorageManager::GetMemoryFromMap(size_t size)
 }
 
 //----------------------------------------------------------------------------------------------
+// @name                    : DefragmentMemoryMap
+//
+// @description             : NOT USED. Looks for consecutive free blocks and merges them.
+//
+// @returns                 : Number of times defragmentation was done
+//----------------------------------------------------------------------------------------------
+int StorageManager::DefragmentMemoryMap()
+{
+    int count = 0;
+    bool done = false;
+    char *curBlock = FindNextFreeSpaceInMemoryMap(m_chunkPtr);
+    char *nextBlock = nullptr;
+
+    if (DEBUG)
+        printf("  Defragmenting memory map...\n");
+
+    do
+    {
+        sm_metaData_t & metaData = m_memoryMap[curBlock];
+        count += HandleFragmentedMemory(curBlock, metaData, nextBlock);
+        if (nextBlock == nullptr)
+        {
+            curBlock = FindNextFreeSpaceInMemoryMap(curBlock);
+        }
+        else
+        {
+            curBlock = nextBlock;
+        }
+    } while (curBlock != nullptr && curBlock < m_chunkPtr + m_chunkTotalSize);
+
+    return count;
+}
+
+//----------------------------------------------------------------------------------------------
 // @name                    : HandleFragmentedMemory
 //
 // @description             : Once a particular block has been marked as free, we check if
-//                            a larger block can be formed by merging this with a neighbouring
-//                            free block.
+//                            a larger block can be formed by merging this with the next
+//                            free block. 
+//                            Limitation: If a free block lies before the current block, then
+//                                        this function would not be able to merge it.
+//                                        TODO: Some mechanism to detect previous free blocks.
 //
-// @returns                 : Nothing
+// @param ptr               : Current block address
+// @param metaData          : Reference of meta data for current block
+// @param nextOccupiedBlock : [OUTPUT] Will store the address of the next occupied block
+//                            address in memory map.
+//
+// @returns                 : Number of times defragmentation was done
 //----------------------------------------------------------------------------------------------
-void StorageManager::HandleFragmentedMemory(char *ptr, sm_metaData_t & metaData)
+int StorageManager::HandleFragmentedMemory(char *ptr, sm_metaData_t & metaData, char *nextOccupiedBlock)
 {
+    static int count = 0;
+    nextOccupiedBlock = nullptr;
+
+    if (ptr == nullptr)
+    {
+        return count;
+    }
+
     if (ptr >= m_chunkPtr + m_chunkTotalSize)
     {
-        printf("Defragment Info: Reached end of chunk. No merge possible\n");
-        return;
+        if (DEBUG)
+        {
+            printf("  Defragment Info: Reached end of chunk. No merge possible\n");
+        }
+
+        return count;
     }
 
     char *nextBlock = ptr + metaData.size;
     if (nextBlock >= m_chunkPtr + m_chunkTotalSize)
     {
-        printf("Defragment Info: Reached end of chunk. No merge possible \n");
-        return;
+        if (DEBUG)
+        {
+            printf("  Defragment Info: Reached end of chunk. No merge possible\n");
+        }
+
+        return count;
     }
 
     // Check if this is free
@@ -361,22 +542,96 @@ void StorageManager::HandleFragmentedMemory(char *ptr, sm_metaData_t & metaData)
         if (nextMetaData.isFree == true)
         {
             if (DEBUG)
-                printf("Merging %lu --> %lu bytes\n", metaData.size, metaData.size + nextMetaData.size);
+                printf("  Merging %lu --> %lu bytes\n", metaData.size, metaData.size + nextMetaData.size);
             
             // Update size of the merged block
             metaData.size += nextMetaData.size;
+            count++;
 
             // remove next block's entry from map since it will 
             // get merged to previous block
             m_memoryMap.erase(it);
 
-            // Check if further blocks can be merged
-            HandleFragmentedMemory(ptr, metaData);
+            // Check if further blocks can be merged, call this function recursively
+            count = HandleFragmentedMemory(ptr, metaData, nextOccupiedBlock);
         }
         else
         {
-            // DO NOTHING
-            // Next block not free. Merge not possible
+            // Next block not free. Merge not possible.
+            // Store the address of the next non-free block.
+            nextOccupiedBlock = it->first;
         }
     }
+    else
+    {
+        //if (DEBUG)
+            //printf("  Defragmentation: Next block 0x%lu not present in Memory Map!\n", nextBlock);
+    }
+
+    int countToReturn = count;
+    count = 0;
+    return countToReturn;
+}
+
+//----------------------------------------------------------------------------------------------
+// @name                    : DisplayCacheMemoryDetails
+//
+// @description             : Cache memory stats
+//
+// @returns                 : Nothing
+//----------------------------------------------------------------------------------------------
+void StorageManager::DisplayCacheMemoryDetails()
+{
+    printf("  Cache block     : 0x%lu %u bytes\n", m_cacheBlock, m_cacheBlockSize);
+}
+
+//----------------------------------------------------------------------------------------------
+// @name                    : DisplayMemoryMapDetails
+//
+// @description             : Displays the address, size and free/occupied status of memory map
+//
+// @returns                 : Nothing
+//----------------------------------------------------------------------------------------------
+void StorageManager::DisplayMemoryMapDetails()
+{
+    printf("\n");
+    printf("+-----------------------------------------------+\n");
+    printf("|               Memory map                      |\n");
+    printf("+-----------------------------------------------+\n");
+    size_t freeSpaceInMemoryMap = 0;
+    unsigned int index = 1;
+    for (auto it = m_memoryMap.begin(); it != m_memoryMap.end(); it++)
+    {
+        sm_metaData_t metaData = it->second;
+        printf("| %3d) 0x%lu : %-4lu bytes   <%-8s>     |\n", index, it->first, metaData.size, metaData.isFree ? "  Free  " : "Occupied");
+        index++;
+    }
+    printf("+-----------------------------------------------+\n");
+}
+
+//----------------------------------------------------------------------------------------------
+// @name                    : DisplayMemoryStats
+//
+// @description             : Memory usage statistics
+//
+// @returns                 : Nothing
+//----------------------------------------------------------------------------------------------
+void StorageManager::DisplayMemoryStats()
+{
+    size_t freeSpaceInMemoryMap = FindFreeSpaceSizeInMemoryMap();
+    unsigned long long totalAllocs = m_countChunkAllocs + m_countMemoryMapAllocs + m_countCacheAllocs;
+
+    printf("+----------------------------------------------------------+\n");
+    printf("|               Storage Manager Statistics                 |\n");
+    printf("+----------------------------------------------------------+\n");
+    printf("| 1) Total chunk size                 : %-12ld bytes |\n", m_chunkTotalSize);
+    printf("| 2) Used chunk size                  : %-12ld bytes |\n", m_chunkUsedSize);
+    printf("| 3) Available chunk size             : %-12ld bytes |\n", m_chunkTotalSize - m_chunkUsedSize);
+    printf("| 4) Reusable recycled memory size    : %-12ld bytes |\n", freeSpaceInMemoryMap);
+    printf("| 5) Total Allocs                     : %-12llu       |\n", totalAllocs);
+    printf("|     a) From memory chunk            : %-12llu       |\n", m_countChunkAllocs);
+    printf("|     b) From recycled memory         : %-12llu       |\n", m_countMemoryMapAllocs);
+    printf("|     c) From cache memory            : %-12llu       |\n", m_countCacheAllocs);
+    printf("| 6) Total Frees                      : %-12llu       |\n", m_countFrees);
+    printf("+----------------------------------------------------------+\n");
 }
